@@ -13,6 +13,12 @@ Combines what were historically `atom_content_style.py` and
 Thresholding CV at its median across active atoms splits the dictionary
 into contentful (below) and stylistic (above) halves, and we report the
 share of total effective score on each side.
+
+With ``--selectivity`` the split instead comes from the paired BOGO test of
+``scripts/bogo_selectivity.py``: contentful = runway-selective atoms,
+stylistic = agnostic + anti-selective atoms. Atoms that test as neither
+(undetermined / inactive) are reported as a separate effective-score share,
+so the two main shares no longer need to sum to 1.
 """
 
 from __future__ import annotations
@@ -60,6 +66,7 @@ def main(
     num_patches_per_image: Annotated[int, typer.Option(help="Patches per image after cue exclusion")] = 255,
     subset_sizes: Annotated[str, typer.Option(help="Comma-separated subset image counts (default: LARDv2 test)")] = "",
     subset_names: Annotated[str, typer.Option()] = "",
+    selectivity: Annotated[Path | None, typer.Option(help="bogo_selectivity.json; replaces the CV split")] = None,
 ):
     with h5py.File(sparse_codes, "r") as f:
         indices = f["indices"][:]                                          # [k, n_cols]
@@ -131,12 +138,22 @@ def main(
     order = np.argsort(-effective_score).tolist()
 
     median_cv = float(np.median(cv[active]))
-    content_mask = cv <= median_cv
     total_eff = effective_score.sum()
+    if selectivity is None:
+        split_method = "cv"
+        content_mask = cv <= median_cv
+        style_mask = ~content_mask
+    else:
+        split_method = "bogo"
+        sel = json.loads(Path(selectivity).read_text())
+        content_mask = np.zeros(m, dtype=bool); content_mask[sel["content_atom_ids"]] = True
+        style_mask = np.zeros(m, dtype=bool); style_mask[sel["style_atom_ids"]] = True
     eff_content = float(effective_score[content_mask].sum() / total_eff) if total_eff > 0 else 0.0
-    eff_style   = 1.0 - eff_content
-    print(f"[ATOMS] n_atoms={m}  median CV={median_cv:.3f}  "
-          f"eff_content={eff_content:.3f}  eff_style={eff_style:.3f}", flush=True)
+    eff_style   = float(effective_score[style_mask].sum() / total_eff) if total_eff > 0 else 0.0
+    eff_undet   = 1.0 - eff_content - eff_style
+    print(f"[ATOMS] n_atoms={m}  split={split_method}  median CV={median_cv:.3f}  "
+          f"eff_content={eff_content:.3f}  eff_style={eff_style:.3f}  "
+          f"eff_undetermined={eff_undet:.3f}", flush=True)
 
     out = {
         "n_atoms": int(m),
@@ -154,10 +171,12 @@ def main(
         "effective_score": effective_score.tolist(),
         "effective_order": order,
         "median_cv": median_cv,
+        "split_method": split_method,
         "content_atom_ids": np.flatnonzero(content_mask).tolist(),
-        "style_atom_ids":   np.flatnonzero(~content_mask).tolist(),
+        "style_atom_ids":   np.flatnonzero(style_mask).tolist(),
         "eff_score_on_contentful": eff_content,
         "eff_score_on_stylistic":  eff_style,
+        "eff_score_on_undetermined": eff_undet,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(out, indent=2))

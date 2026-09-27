@@ -30,8 +30,18 @@ numerical crunching (mean/std across seeds, histogram binning).
         "seeds": [{"seed": <int>, "nz": [...], "auroc": [...],
                    "content_frac": [...]}, ...],
         "mean":  {"nz": [...], "auroc": [...], "content_frac": [...]}
-      } | null
+      } | null,
+      "content_style_bogo": {           # optional, from *_atoms_bogo.json
+        "<variant>": {"content": [mean, std], "style": [mean, std],
+                      "undetermined": [mean, std]} | null
+      },
+      "bogo_selectivity": {             # optional, from *_bogo_selectivity.json
+        "<variant>": {"<label>": [mean, std], ..., "kappa_vs_cv": [mean, std]} | null
+      }
     }
+
+Atom ids are not comparable across seeds (each seed has its own dictionary),
+so BOGO-selectivity is aggregated as label counts, not per-atom agreement.
 """
 
 from __future__ import annotations
@@ -114,6 +124,39 @@ def _load_content_style(results_dir: Path, variant: str) -> dict[int, dict]:
         if c is None or s is None:
             continue
         out[seed] = {"content": float(c), "style": float(s)}
+    return out
+
+
+def _load_content_style_bogo(results_dir: Path, variant: str) -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    for path in sorted(glob.glob(str(results_dir / f"{variant}_seed*_atoms_bogo.json"))):
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception:
+            continue
+        seed = int(Path(path).stem.split("_seed")[1].split("_")[0])
+        out[seed] = {"content":      float(data["eff_score_on_contentful"]),
+                     "style":        float(data["eff_score_on_stylistic"]),
+                     "undetermined": float(data.get("eff_score_on_undetermined", 0.0))}
+    return out
+
+
+BOGO_LABELS = ("selective", "anti", "agnostic", "undetermined", "inactive")
+
+
+def _load_bogo_selectivity(results_dir: Path, variant: str) -> dict[int, dict]:
+    out: dict[int, dict] = {}
+    for path in sorted(glob.glob(str(results_dir / f"{variant}_seed*_bogo_selectivity.json"))):
+        try:
+            summary = json.loads(Path(path).read_text())["summary"]
+        except Exception:
+            continue
+        seed = int(Path(path).stem.split("_seed")[1].split("_")[0])
+        entry = {k: float(summary["counts"].get(k, 0)) for k in BOGO_LABELS}
+        kappa = (summary.get("vs_cv") or {}).get("cohen_kappa_selective_vs_cv_content")
+        if kappa is not None:
+            entry["kappa_vs_cv"] = float(kappa)
+        out[seed] = entry
     return out
 
 
@@ -204,6 +247,8 @@ def main() -> None:
 
     regression: dict = {}
     content_style: dict = {}
+    content_style_bogo: dict = {}
+    bogo_selectivity: dict = {}
     n_seeds: dict[str, int] = {}
 
     for variant in VARIANTS:
@@ -217,6 +262,14 @@ def main() -> None:
 
         cs_agg = {k: _agg(cs, k) for k in ("content", "style")}
         content_style[variant] = cs_agg if any(v is not None for v in cs_agg.values()) else None
+
+        csb = _load_content_style_bogo(args.results_dir, variant)
+        csb_agg = {k: _agg(csb, k) for k in ("content", "style", "undetermined")}
+        content_style_bogo[variant] = csb_agg if any(v is not None for v in csb_agg.values()) else None
+
+        sel = _load_bogo_selectivity(args.results_dir, variant)
+        sel_agg = {k: _agg(sel, k) for k in (*BOGO_LABELS, "kappa_vs_cv")}
+        bogo_selectivity[variant] = sel_agg if any(v is not None for v in sel_agg.values()) else None
 
     cv_hist   = _cv_hist(args.results_dir)
     ims_sweep = _ims_sweep(args.results_dir)
@@ -235,6 +288,8 @@ def main() -> None:
         "content_style": content_style,
         "cv_hist":       cv_hist,
         "ims_sweep":     ims_sweep,
+        "content_style_bogo": content_style_bogo,
+        "bogo_selectivity":   bogo_selectivity,
     }, indent=2) + "\n")
     ims_n = len(ims_sweep["seeds"]) if ims_sweep else 0
     print(f"[AGG] wrote {args.out}  n_seeds={n_seeds}  "

@@ -5,9 +5,13 @@ Scope: only what the paper consumes.
 - ``LARDv2Dataset(subset, split, ood=False)`` materializes BOGO-cropped
   samples. Train uses a random valid crop (data augmentation); val and test
   use the deterministic center of the valid range so metrics are reproducible.
-- ``LARDv2Dataset(..., ood=True)`` produces inverse-BOGO crops where at
-  least one runway corner falls outside the crop window: these are the
+- ``LARDv2Dataset(..., ood=True)`` produces inverse-BOGO crops where all
+  four runway corners fall outside the crop window: these are the
   negatives for the IMS classifier of main.typ @sec:ims-lr.
+- ``LARDv2PairedDataset`` yields, for every LARDv2 row, a BOGO crop and a
+  matched negative crop of the *same* image (inverse-BOGO, optionally with
+  the whole runway polygon excluded, or a second BOGO crop as a null
+  control). Used by the paired BOGO-selectivity test.
 - ``LARDTrainDataset`` wraps a LARDv2Dataset into a torch Dataset with
   resize + ImageNet normalization + batchable runway_side index.
 
@@ -140,18 +144,64 @@ def _bogocrop(sample: dict, output_size: int, margin: int,
         image_id=sample.get("image_id", ""),
         metadata={"runway_side": _parse_runway_side(sample.get("runway")),
                   "runway": sample.get("runway", ""),
-                  "airport": sample.get("airport", "")},
+                  "airport": sample.get("airport", ""),
+                  "scenario": sample.get("scenario", ""),
+                  "crop_x": int(crop_x), "crop_y": int(crop_y), "scale": float(scale)},
     )
 
 
+def _convex_hull(pts: np.ndarray) -> np.ndarray:
+    """Counter-clockwise convex hull of a handful of 2D points (monotone chain)."""
+    pts = np.unique(pts, axis=0)
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower: list[np.ndarray] = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper: list[np.ndarray] = []
+    for p in pts[::-1]:
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return np.array(lower[:-1] + upper[:-1])
+
+
+def _rect_intersects_convex(poly: np.ndarray, x0: float, y0: float, size: float) -> bool:
+    """Separating-axis test between the square [x0, x0+size]^2 and a convex polygon."""
+    rect = np.array([[x0, y0], [x0 + size, y0], [x0 + size, y0 + size], [x0, y0 + size]])
+    axes = [np.array([1.0, 0.0]), np.array([0.0, 1.0])]
+    for i in range(len(poly)):
+        edge = poly[(i + 1) % len(poly)] - poly[i]
+        if np.any(edge != 0):
+            axes.append(np.array([-edge[1], edge[0]]))
+    for ax in axes:
+        p, r = poly @ ax, rect @ ax
+        if p.max() < r.min() or r.max() < p.min():
+            return False
+    return True
+
+
 def _inverse_bogocrop(sample: dict, output_size: int, margin: int,
-                      max_attempts: int = 100) -> KeypointSample | None:
-    """Same scale as BOGO, but crop where all four runway corners stay outside.
+                      max_attempts: int = 100, exclude: str = "corners",
+                      y_range: tuple[int, int] | None = None) -> KeypointSample | None:
+    """Same scale as BOGO, but crop where the runway stays outside.
 
     Used as the IMS-negative class in main.typ @sec:ims-lr. We first try a
     bounded number of random proposals and then fall back to a deterministic
     grid scan so the search always terminates. Returns None if no such crop
     exists at the chosen scale.
+
+    ``exclude="corners"`` (paper default) only requires all four corners to
+    fall outside the window, so the runway body may still cross it;
+    ``exclude="polygon"`` rejects any window that intersects the runway
+    quadrilateral. ``y_range`` optionally restricts the crop origin's y
+    (scaled coordinates), e.g. to stay in the vertical band of the BOGO crop.
     """
     img: Image.Image = sample["image"]
     orig_w, orig_h = sample["width"], sample["height"]
@@ -169,10 +219,21 @@ def _inverse_bogocrop(sample: dict, output_size: int, margin: int,
     max_cy = max(0, scaled_h - output_size)
     if max_cx == 0 and max_cy == 0:
         return None
+    min_cy = 0
+    if y_range is not None:
+        min_cy = max(0, min(max_cy, y_range[0]))
+        max_cy = max(min_cy, min(max_cy, y_range[1]))
+    # TL, TR, BR, BL; hull guards against slightly non-convex annotations.
+    runway_poly = _convex_hull(np.stack([scaled_xs[[0, 1, 3, 2]], scaled_ys[[0, 1, 3, 2]]], axis=1))
 
     def _inside_mask(crop_x: int, crop_y: int) -> np.ndarray:
         return ((scaled_xs >= crop_x) & (scaled_xs < crop_x + output_size)
                 & (scaled_ys >= crop_y) & (scaled_ys < crop_y + output_size))
+
+    def _rejected(crop_x: int, crop_y: int, inside: np.ndarray) -> bool:
+        if inside.any():
+            return True
+        return exclude == "polygon" and _rect_intersects_convex(runway_poly, crop_x, crop_y, output_size)
 
     def _materialize(crop_x: int, crop_y: int, inside: np.ndarray) -> KeypointSample:
         crop_size_orig = output_size / scale
@@ -188,23 +249,27 @@ def _inverse_bogocrop(sample: dict, output_size: int, margin: int,
         return KeypointSample(
             image=image_np, keypoints=keypoints, visibility=visibility,
             image_id=sample.get("image_id", ""),
-            metadata={"runway_side": _parse_runway_side(sample.get("runway"))},
+            metadata={"runway_side": _parse_runway_side(sample.get("runway")),
+                      "runway": sample.get("runway", ""),
+                      "airport": sample.get("airport", ""),
+                      "scenario": sample.get("scenario", ""),
+                      "crop_x": int(crop_x), "crop_y": int(crop_y), "scale": float(scale)},
         )
 
     for _ in range(max_attempts):
         crop_x = random.randint(0, max_cx)
-        crop_y = random.randint(0, max_cy)
+        crop_y = random.randint(min_cy, max_cy)
         inside = _inside_mask(crop_x, crop_y)
-        if inside.any():
+        if _rejected(crop_x, crop_y, inside):
             continue
         return _materialize(crop_x, crop_y, inside)
 
     xs_scan = np.unique(np.linspace(0, max_cx, num=min(max_cx + 1, 33), dtype=int))
-    ys_scan = np.unique(np.linspace(0, max_cy, num=min(max_cy + 1, 33), dtype=int))
+    ys_scan = np.unique(np.linspace(min_cy, max_cy, num=min(max_cy - min_cy + 1, 33), dtype=int))
     for crop_x in xs_scan:
         for crop_y in ys_scan:
             inside = _inside_mask(int(crop_x), int(crop_y))
-            if inside.any():
+            if _rejected(int(crop_x), int(crop_y), inside):
                 continue
             return _materialize(int(crop_x), int(crop_y), inside)
     return None
@@ -301,6 +366,96 @@ class LARDv2Dataset:
 
     def __getitem__(self, idx: int) -> KeypointSample:
         return self._samples[idx]
+
+
+def _load_paired_samples(subset: str, split: str, max_samples: int | None,
+                         cache_dir: str | None, output_size: int, margin: int,
+                         negative: str, exclude: str, max_dy: int | None,
+                         ) -> list[tuple[KeypointSample, KeypointSample]]:
+    from datasets import load_dataset
+    streaming = bool(max_samples) and max_samples <= 500
+    ds = load_dataset(_HF_DATASET, name=subset, split=split,
+                      cache_dir=cache_dir, streaming=streaming)
+    pairs: list[tuple[KeypointSample, KeypointSample]] = []
+    skipped = 0
+    for i, row in enumerate(ds):
+        if max_samples and len(pairs) >= max_samples:
+            break
+        pos = _bogocrop(row, output_size, margin, deterministic=False)
+        if negative == "bogo":
+            neg = _bogocrop(row, output_size, margin, deterministic=False)
+        else:
+            y_range = None
+            if max_dy is not None:
+                cy = pos.metadata["crop_y"]
+                y_range = (cy - max_dy, cy + max_dy)
+            neg = _inverse_bogocrop(row, output_size, margin,
+                                    exclude=exclude, y_range=y_range)
+        if neg is None:
+            skipped += 1
+            continue
+        pos.image_id = neg.image_id = f"lard_{subset}_{split}_{i}"
+        pairs.append((pos, neg))
+    msg = f"[LARD-PAIRED] {subset}/{split}: {len(pairs)} pairs (negative={negative})"
+    if skipped:
+        msg += f" ({skipped} skipped)"
+    print(msg, flush=True)
+    return pairs
+
+
+class LARDv2PairedDataset:
+    """A BOGO crop and a matched negative crop from every LARDv2 row.
+
+    ``positive[i]`` and ``negative[i]`` come from the same source image, so
+    everything that is constant within an image (renderer, source, season,
+    weather, time of day) is held fixed between them. ``negative`` selects
+    the control crop:
+
+    - ``"inverse"``: inverse-BOGO crop at the BOGO scale (``exclude`` picks
+      corner-only or whole-polygon exclusion; ``max_dy`` keeps the crop
+      origin within ``max_dy`` scaled pixels of the BOGO crop's y).
+    - ``"bogo"``: a second, independently sampled BOGO crop (null control).
+
+    Rows without a valid negative are dropped from both lists, so
+    ``subset_sizes`` counts pairs. Crop positions come from ``random``; seed
+    it before construction for reproducibility.
+    """
+
+    def __init__(
+        self,
+        subset: str = "all",
+        split: str = "test",
+        max_samples: int | None = None,
+        output_size: int = IMG_SIZE,
+        margin: int = 50,
+        cache_dir: str | None = None,
+        negative: str = "inverse",
+        exclude: str = "polygon",
+        max_dy: int | None = None,
+    ):
+        assert negative in ("inverse", "bogo"), negative
+        assert exclude in ("corners", "polygon"), exclude
+        if cache_dir is None:
+            cache_dir = os.environ.get("LARD_CACHE_DIR")
+        subsets = LARDV2_SUBSETS if subset == "all" else [subset]
+        self.positive: list[KeypointSample] = []
+        self.negative: list[KeypointSample] = []
+        self.subset_names: list[str] = []
+        self.subset_sizes: list[int] = []
+        for s in subsets:
+            pairs = _load_paired_samples(s, split, max_samples, cache_dir, output_size,
+                                         margin, negative, exclude, max_dy)
+            if pairs:
+                self.positive.extend(p for p, _ in pairs)
+                self.negative.extend(n for _, n in pairs)
+                self.subset_names.append(s)
+                self.subset_sizes.append(len(pairs))
+        print(f"[LARD-PAIRED] Total: {len(self.positive)} pairs "
+              f"(subset={subset}, split={split}, negative={negative}, exclude={exclude})",
+              flush=True)
+
+    def __len__(self) -> int:
+        return len(self.positive)
 
 
 _SIDE_TO_INT = {"": 0, "L": 1, "R": 2, "C": 3}

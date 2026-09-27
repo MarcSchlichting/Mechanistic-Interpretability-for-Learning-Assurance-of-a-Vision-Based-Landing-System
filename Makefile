@@ -17,6 +17,8 @@
 #   sec:content-style / sec:head-weight <-  atoms
 #   sec:atom-viz                    <-  atom_viz
 #   sec:ims-lr / sec:bogo-res       <-  attn_pooled  +  ims_sweep
+#   (variant) BOGO-selectivity split <-  bogo_all = paired_patches + paired_codes
+#                                        + bogo_select + atoms_bogo  (+ bogo_null)
 #   tab:training, tab:content-style,
 #   fig:ims-sweep, fig:cv-hist      <-  aggregate  (emits figs/aggregated.json;
 #                                        hand-written typst reads it)
@@ -70,6 +72,17 @@ ATOMS_JSON   := $(RESULTS_DIR)/$(TAG)_atoms.json
 IMS_JSON     := $(RESULTS_DIR)/$(TAG)_ims_sweep.json
 VIZ_STAMP    := $(FIG_DIR)/atoms_$(TAG)/.stamp
 
+# Paired BOGO-selectivity split (alternative to the CV split). PAIRED_*
+# pairs BOGO with inverse-BOGO crops; CTRL_* pairs BOGO with a second BOGO
+# crop and is the null control (should yield ~no selective atoms).
+PAIRED_EXCLUDE ?= polygon
+PAIRED_MAX_DY  ?= -1
+PAIRED_PREFIX  := $(DATA_DIR)/$(TAG)_paired
+CTRL_PREFIX    := $(DATA_DIR)/$(TAG)_ctrl
+SEL_JSON       := $(RESULTS_DIR)/$(TAG)_bogo_selectivity.json
+CTRL_JSON      := $(RESULTS_DIR)/$(TAG)_bogo_selectivity_ctrl.json
+ATOMS_BOGO_JSON := $(RESULTS_DIR)/$(TAG)_atoms_bogo.json
+
 # Paper figure / table artifacts (multi-seed aggregates). One JSON feeds all
 # hand-written typst tables and figures; no per-figure emitters anymore.
 AGG_JSON     := $(FIG_DIR)/aggregated.json
@@ -77,7 +90,8 @@ AGG_JSON     := $(FIG_DIR)/aggregated.json
 
 .PHONY: help all clean deep-clean \
         train eval extract_patches ksvd codes atoms attn_pooled ims_sweep \
-        atom_viz aggregate paper
+        atom_viz aggregate paper \
+        paired_patches paired_codes bogo_select atoms_bogo bogo_null bogo_all
 
 help:
 	@echo "Usage: make <target> [VARIANT=pretrained|scratch] [SEED=0] [DEVICE=cuda:0] [DRY=1]"
@@ -92,6 +106,14 @@ help:
 	@echo "  attn_pooled      BOGO + inverse-BOGO attention-pooled codes"
 	@echo "  ims_sweep        Constrained L1 IMS detector lambda-sweep"
 	@echo "  atom_viz         Top-activating-patch grids for each atom"
+	@echo ""
+	@echo "BOGO-selectivity split (variant of the CV content/style split):"
+	@echo "  paired_patches   Patch tokens of paired BOGO / inverse-BOGO crops"
+	@echo "  paired_codes     Sparse-code both crop sets"
+	@echo "  bogo_select      Cluster permutation + TOST selectivity labels per atom"
+	@echo "  atoms_bogo       Effective-score shares under the BOGO split"
+	@echo "  bogo_null        Null control: BOGO vs second BOGO crop"
+	@echo "  bogo_all         All of the above"
 	@echo ""
 	@echo "Cross-seed paper artifacts (run after multi-seed sweep):"
 	@echo "  aggregate        Emit tab_regression + tab_content_style + fig_ims_sweep"
@@ -177,6 +199,56 @@ ims_sweep: $(IMS_JSON)
 $(IMS_JSON): $(ATTN_NPZ) $(ATOMS_JSON)
 	$(PY) scripts/ims_sweep.py --codes $(ATTN_NPZ) --atoms $(ATOMS_JSON) \
 	    --seed $(SEED) --out $(IMS_JSON)
+
+# ── 5b. Paired BOGO-selectivity split (variant of @sec:content-style) ─
+paired_patches: $(PAIRED_PREFIX)_pos_patches.h5
+
+$(PAIRED_PREFIX)_pos_patches.h5 $(PAIRED_PREFIX)_neg_patches.h5 $(PAIRED_PREFIX)_meta.npz &: $(CKPT)
+	@mkdir -p $(DATA_DIR)
+	$(PY) scripts/extract_paired_patches.py --checkpoint $(CKPT) \
+	    --out-prefix $(PAIRED_PREFIX) --negative inverse \
+	    --exclude $(PAIRED_EXCLUDE) --max-dy $(PAIRED_MAX_DY) \
+	    --seed $(SEED) --device $(DEVICE)
+
+$(CTRL_PREFIX)_pos_patches.h5 $(CTRL_PREFIX)_neg_patches.h5 $(CTRL_PREFIX)_meta.npz &: $(CKPT)
+	@mkdir -p $(DATA_DIR)
+	$(PY) scripts/extract_paired_patches.py --checkpoint $(CKPT) \
+	    --out-prefix $(CTRL_PREFIX) --negative bogo \
+	    --seed $(SEED) --device $(DEVICE)
+
+paired_codes: $(PAIRED_PREFIX)_pos_codes.h5 $(PAIRED_PREFIX)_neg_codes.h5
+
+# {prefix}_{pos,neg}_patches.h5 -> {prefix}_{pos,neg}_codes.h5
+ifneq ($(strip $(DRY)),)
+$(DATA_DIR)/%_codes.h5: $(DATA_DIR)/%_patches.h5 $(DICT_NPY)
+	$(PY) scripts/dry_stub_ksvd.py codes $< $(DICT_NPY) $@
+else
+$(DATA_DIR)/%_codes.h5: $(DATA_DIR)/%_patches.h5 $(DICT_NPY)
+	$(JULIA) $(JULIA_FLAGS) scripts/julia/sparse_code_patches.jl $< $(DICT_NPY) $@
+endif
+
+bogo_select: $(SEL_JSON)
+
+$(SEL_JSON): $(PAIRED_PREFIX)_pos_codes.h5 $(PAIRED_PREFIX)_neg_codes.h5 $(PAIRED_PREFIX)_meta.npz $(ATOMS_JSON)
+	$(PY) scripts/bogo_selectivity.py --pos-codes $(PAIRED_PREFIX)_pos_codes.h5 \
+	    --neg-codes $(PAIRED_PREFIX)_neg_codes.h5 --meta $(PAIRED_PREFIX)_meta.npz \
+	    --atoms $(ATOMS_JSON) --seed $(SEED) --out $@
+
+bogo_null: $(CTRL_JSON)
+
+$(CTRL_JSON): $(CTRL_PREFIX)_pos_codes.h5 $(CTRL_PREFIX)_neg_codes.h5 $(CTRL_PREFIX)_meta.npz
+	$(PY) scripts/bogo_selectivity.py --pos-codes $(CTRL_PREFIX)_pos_codes.h5 \
+	    --neg-codes $(CTRL_PREFIX)_neg_codes.h5 --meta $(CTRL_PREFIX)_meta.npz \
+	    --seed $(SEED) --out $@
+
+atoms_bogo: $(ATOMS_BOGO_JSON)
+
+$(ATOMS_BOGO_JSON): $(CODES_H5) $(DICT_NPY) $(HEAD_NPZ) $(SEL_JSON)
+	$(PY) scripts/atoms.py --sparse-codes $(CODES_H5) \
+	    --dictionary $(DICT_NPY) --head $(HEAD_NPZ) \
+	    --selectivity $(SEL_JSON) --output $@
+
+bogo_all: bogo_select atoms_bogo bogo_null
 
 # ── 6. Cross-seed aggregates (after the sweep) ───────────────────────
 ifneq ($(strip $(DRY)),)
